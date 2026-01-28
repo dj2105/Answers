@@ -3,11 +3,14 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple, Union
 
 OUTPUT_PATH = Path("answers_exam_style.pdf")
 
 
+# -----------------------------
+# Layout items
+# -----------------------------
 @dataclass
 class Line:
     text: str
@@ -15,6 +18,17 @@ class Line:
     size: float
     x: float
     y: float
+
+
+@dataclass
+class Rule:
+    x1: float
+    x2: float
+    y: float
+    thickness: float = 0.6
+
+
+PageItem = Union[Line, Rule]
 
 
 @dataclass
@@ -28,6 +42,9 @@ class Style:
     align: str = "left"
 
 
+# -----------------------------
+# Minimal TrueType reader
+# -----------------------------
 class TrueTypeFont:
     def __init__(self, path: Path, name: str) -> None:
         self.path = path
@@ -39,7 +56,11 @@ class TrueTypeFont:
         self.num_glyphs = self._read_maxp()
         self.advance_widths = self._read_hmtx()
         self.cmap = self._read_cmap()
+
         self.used_gids: set[int] = set()
+        # IMPORTANT: record which Unicode codepoint we intended for each GID.
+        # This prevents “Q uestion”-style oddities and bad extraction.
+        self.gid_to_unicode: Dict[int, int] = {}
 
     def _read_tables(self) -> Dict[str, Tuple[int, int]]:
         num_tables = struct.unpack(">H", self.data[4:6])[0]
@@ -111,8 +132,9 @@ class TrueTypeFont:
         id_delta_offset = start_offset + seg_count * 2
         id_deltas = struct.unpack(">" + "h" * seg_count, self.data[id_delta_offset : id_delta_offset + seg_count * 2])
         id_range_offset_offset = id_delta_offset + seg_count * 2
-        id_range_offsets = struct.unpack(">" + "H" * seg_count, self.data[id_range_offset_offset : id_range_offset_offset + seg_count * 2])
-        glyph_array_offset = id_range_offset_offset + seg_count * 2
+        id_range_offsets = struct.unpack(
+            ">" + "H" * seg_count, self.data[id_range_offset_offset : id_range_offset_offset + seg_count * 2]
+        )
         cmap: Dict[int, int] = {}
         for i in range(seg_count):
             start = start_codes[i]
@@ -146,10 +168,17 @@ class TrueTypeFont:
         return self.advance_widths.get(gid, 0) * 1000 / self.units_per_em
 
     def encode_text(self, text: str) -> str:
+        """
+        Encode to Identity-H with 2-byte glyph IDs (CID = GID).
+        Also record an intended GID->Unicode mapping for ToUnicode.
+        """
         hex_bytes = []
         for ch in text:
-            gid = self.cmap.get(ord(ch), 0)
+            codepoint = ord(ch)
+            gid = self.cmap.get(codepoint, 0)
             self.used_gids.add(gid)
+            if gid != 0 and gid not in self.gid_to_unicode:
+                self.gid_to_unicode[gid] = codepoint
             hex_bytes.append(f"{gid:04X}")
         return "<" + "".join(hex_bytes) + ">"
 
@@ -161,6 +190,9 @@ class TrueTypeFont:
         return total * size / 1000
 
 
+# -----------------------------
+# PDF writer (objects + xref)
+# -----------------------------
 class PDFWriter:
     def __init__(self) -> None:
         self.objects: List[bytes] = []
@@ -190,8 +222,46 @@ class PDFWriter:
         return b"".join(output)
 
 
+# -----------------------------
+# Font objects (Type0 + CIDFontType2 + ToUnicode)
+# -----------------------------
+def build_to_unicode(font: TrueTypeFont) -> bytes:
+    # Use the recorded intended mapping, NOT a reverse-scan of font.cmap
+    entries = sorted(font.gid_to_unicode.items())  # (gid, codepoint)
+
+    blocks: List[str] = []
+    for i in range(0, len(entries), 100):
+        chunk = entries[i : i + 100]
+        block = f"{len(chunk)} beginbfchar\n"
+        for gid, codepoint in chunk:
+            # BMP only; fine for this document’s character set
+            block += f"<{gid:04X}> <{codepoint:04X}>\n"
+        block += "endbfchar\n"
+        blocks.append(block)
+
+    cmap = (
+        "/CIDInit /ProcSet findresource begin\n"
+        "12 dict begin\n"
+        "begincmap\n"
+        "/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> def\n"
+        "/CMapName /Identity-H def\n"
+        "/CMapType 2 def\n"
+        "1 begincodespacerange\n"
+        "<0000> <FFFF>\n"
+        "endcodespacerange\n"
+        + "".join(blocks)
+        + "endcmap\n"
+        "CMapName currentdict /CMap defineresource pop\n"
+        "end\n"
+        "end\n"
+    ).encode("ascii")
+
+    return b"<< /Length " + str(len(cmap)).encode("ascii") + b" >>\nstream\n" + cmap + b"\nendstream"
+
+
 def font_objects(font: TrueTypeFont, alias: str) -> Tuple[int, int, int, int, int, List[bytes]]:
     writer = PDFWriter()
+
     font_file_stream = (
         b"<< /Length "
         + str(len(font.data)).encode("ascii")
@@ -271,120 +341,199 @@ def font_objects(font: TrueTypeFont, alias: str) -> Tuple[int, int, int, int, in
     )
 
 
-def build_to_unicode(font: TrueTypeFont) -> bytes:
-    entries = []
-    for gid in sorted(gid for gid in font.used_gids if gid != 0):
-        chars = [code for code, mapped_gid in font.cmap.items() if mapped_gid == gid]
-        if not chars:
-            continue
-        codepoint = chars[0]
-        entries.append((gid, codepoint))
-    blocks = []
-    for i in range(0, len(entries), 100):
-        chunk = entries[i : i + 100]
-        block = f"{len(chunk)} beginbfchar\n"
-        for gid, codepoint in chunk:
-            block += f"<{gid:04X}> <{codepoint:04X}>\n"
-        block += "endbfchar\n"
-        blocks.append(block)
-    cmap = (
-        "/CIDInit /ProcSet findresource begin\n"
-        "12 dict begin\n"
-        "begincmap\n"
-        "/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> def\n"
-        "/CMapName /Identity-H def\n"
-        "/CMapType 2 def\n"
-        "1 begincodespacerange\n"
-        "<0000> <FFFF>\n"
-        "endcodespacerange\n"
-        + "".join(blocks)
-        + "endcmap\n"
-        "CMapName currentdict /CMap defineresource pop\n"
-        "end\n"
-        "end\n"
-    ).encode("ascii")
-    return b"<< /Length " + str(len(cmap)).encode("ascii") + b" >>\nstream\n" + cmap + b"endstream"
-
-
+# -----------------------------
+# Layout: baseline grid, rules, rhythm
+# -----------------------------
 def layout_lines(
     blocks: Iterable[Tuple[str, Style]],
     fonts: Dict[str, TrueTypeFont],
     page_width: float,
     page_height: float,
     margin: float,
-) -> List[List[Line]]:
-    pages: List[List[Line]] = [[]]
-    y = page_height - margin
+) -> List[List[PageItem]]:
+    pages: List[List[PageItem]] = [[]]
+
+    grid = 12.0  # baseline grid in points (tight, consistent)
+    def snap(y: float) -> float:
+        return round(y / grid) * grid
+
+    y = snap(page_height - margin)
+
     for text, style in blocks:
-        y -= style.space_before
-        for raw_line in text.split("\n"):
-            line = raw_line
+        is_rule = (text == "__RULE__")
+
+        y = snap(y - style.space_before)
+
+        if is_rule:
+            # horizontal rule across the text block width
             if y - style.leading < margin:
                 pages.append([])
-                y = page_height - margin
+                y = snap(page_height - margin)
+
+            rule_y = snap(y - (style.leading * 0.25))
+            x1 = margin
+            x2 = page_width - margin
+            pages[-1].append(Rule(x1=x1, x2=x2, y=rule_y, thickness=0.6))
+            y = snap(rule_y - style.space_after - (style.leading * 0.25))
+            continue
+
+        for raw_line in text.split("\n"):
+            if y - style.leading < margin:
+                pages.append([])
+                y = snap(page_height - margin)
+
+            line = raw_line
             x = margin + style.indent
+
             if style.align == "center":
                 width = fonts[style.font_key].text_width(line, style.size)
                 x = (page_width - width) / 2
+
             pages[-1].append(Line(line, style.font_key, style.size, x, y))
-            y -= style.leading
-        y -= style.space_after
+            y = snap(y - style.leading)
+
+        y = snap(y - style.space_after)
+
     return pages
 
 
-def build_content_stream(pages: List[List[Line]], fonts: Dict[str, TrueTypeFont]) -> List[bytes]:
+# -----------------------------
+# Content stream: header/footer/page nos + rules
+# -----------------------------
+def build_content_stream(
+    pages: List[List[PageItem]],
+    fonts: Dict[str, TrueTypeFont],
+    page_width: float,
+    page_height: float,
+    margin: float,
+    header_left: str,
+    header_right: str,
+    footer_left: str,
+) -> List[bytes]:
     streams: List[bytes] = []
-    for page in pages:
-        parts = ["BT"]
-        for line in page:
-            font_key = line.font_key
-            font_alias = "F1" if font_key == "regular" else "F2"
-            encoded = fonts[font_key].encode_text(line.text)
-            parts.append(f"/{font_alias} {line.size:.2f} Tf")
-            parts.append(f"1 0 0 1 {line.x:.2f} {line.y:.2f} Tm")
-            parts.append(f"{encoded} Tj")
+    total_pages = len(pages)
+
+    header_y = page_height - (margin * 0.65)
+    footer_y = margin * 0.55
+    header_rule_y = page_height - margin + 10
+
+    for page_index, page in enumerate(pages, start=1):
+        parts: List[str] = []
+
+        # ---- Header rule ----
+        parts.append("q")
+        parts.append("0 0 0 RG")     # black stroke
+        parts.append("0.6 w")        # thin line
+        parts.append(f"{margin:.2f} {header_rule_y:.2f} m")
+        parts.append(f"{(page_width - margin):.2f} {header_rule_y:.2f} l")
+        parts.append("S")
+        parts.append("Q")
+
+        # ---- Header + footer text ----
+        parts.append("BT")
+        parts.append("0 Tc")         # force normal character spacing
+
+        # Header left (bold)
+        parts.append("/F2 10 Tf")
+        parts.append(f"1 0 0 1 {margin:.2f} {header_y:.2f} Tm")
+        parts.append(f"{fonts['bold'].encode_text(header_left)} Tj")
+
+        # Header right (regular, right-aligned)
+        parts.append("/F1 10 Tf")
+        right_w = fonts["regular"].text_width(header_right, 10)
+        parts.append(f"1 0 0 1 {(page_width - margin - right_w):.2f} {header_y:.2f} Tm")
+        parts.append(f"{fonts['regular'].encode_text(header_right)} Tj")
+
+        # Footer left
+        parts.append("/F1 9 Tf")
+        parts.append(f"1 0 0 1 {margin:.2f} {footer_y:.2f} Tm")
+        parts.append(f"{fonts['regular'].encode_text(footer_left)} Tj")
+
+        # Footer right: page numbering
+        page_label = f"Page {page_index} of {total_pages}"
+        pw = fonts["regular"].text_width(page_label, 9)
+        parts.append(f"1 0 0 1 {(page_width - margin - pw):.2f} {footer_y:.2f} Tm")
+        parts.append(f"{fonts['regular'].encode_text(page_label)} Tj")
+
         parts.append("ET")
+
+        # ---- Body text ----
+        parts.append("BT")
+        parts.append("0 Tc")
+
+        for item in page:
+            if isinstance(item, Line):
+                font_alias = "F1" if item.font_key == "regular" else "F2"
+                encoded = fonts[item.font_key].encode_text(item.text)
+                parts.append(f"/{font_alias} {item.size:.2f} Tf")
+                parts.append(f"1 0 0 1 {item.x:.2f} {item.y:.2f} Tm")
+                parts.append(f"{encoded} Tj")
+
+        parts.append("ET")
+
+        # ---- Body rules (outside BT/ET) ----
+        for item in page:
+            if isinstance(item, Rule):
+                parts.append("q")
+                parts.append("0 0 0 RG")
+                parts.append(f"{item.thickness:.2f} w")
+                parts.append(f"{item.x1:.2f} {item.y:.2f} m")
+                parts.append(f"{item.x2:.2f} {item.y:.2f} l")
+                parts.append("S")
+                parts.append("Q")
+
         data = "\n".join(parts).encode("ascii")
         streams.append(b"<< /Length " + str(len(data)).encode("ascii") + b" >>\nstream\n" + data + b"\nendstream")
+
     return streams
 
 
+# -----------------------------
+# Main
+# -----------------------------
 def main() -> None:
+    # Codespaces usually has DejaVu here; if not: sudo apt-get install -y fonts-dejavu-core
     font_dir = Path("/usr/share/fonts/truetype/dejavu")
     fonts = {
         "regular": TrueTypeFont(font_dir / "DejaVuSans.ttf", "DejaVuSans"),
         "bold": TrueTypeFont(font_dir / "DejaVuSans-Bold.ttf", "DejaVuSans-Bold"),
     }
 
+    # SEC/JC-ish rhythm: baseline grid is 12pt; keep leading at 12/18/24 so it locks in.
     styles = {
-        "title": Style("bold", 18, 24, 0, 0, 8, "center"),
-        "question": Style("bold", 13, 18, 0, 4, 4),
-        "part": Style("bold", 11, 15, 0, 2, 2),
-        "body": Style("regular", 11, 15, 12, 0, 2),
-        "sub": Style("regular", 11, 15, 24, 0, 2),
-        "separator": Style("regular", 11, 15, 0, 2, 2, "center"),
+        "title": Style("bold", 16, 24, 0, 0, 10, "center"),
+        "question": Style("bold", 12, 18, 0, 8, 2),
+        "part": Style("bold", 11, 12, 0, 6, 2),
+        "body": Style("regular", 11, 12, 12, 0, 2),
+        "sub": Style("regular", 11, 12, 24, 0, 2),
+        # Separator now only controls spacing around a drawn rule:
+        "separator": Style("regular", 11, 12, 0, 8, 8, "center"),
     }
 
     blocks: List[Tuple[str, Style]] = [
         ("Answers", styles["title"]),
-        ("⸻", styles["separator"]),
+        ("__RULE__", styles["separator"]),
+
         ("Question 1", styles["question"]),
         ("A. Write each ratio in its simplest form:", styles["part"]),
         ("i) 35 : 15", styles["body"]),
         ("35 ÷ 5 : 15 ÷ 5\n= 7 : 3", styles["sub"]),
         ("ii) 1/3 : 3/4", styles["body"]),
         ("Multiply both terms by 12:\n(1/3 × 12) : (3/4 × 12)\n= 4 : 9", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("B. €58.50 is divided between Ann and Barry in the ratio 8 : 5.", styles["part"]),
         ("How much does each person receive?", styles["body"]),
         ("Total parts = 8 + 5 = 13", styles["sub"]),
         ("Ann’s share = (8/13) × 58.50 = €36.00\nBarry’s share = (5/13) × 58.50 = €22.50", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("C. Sam and Tina share a bag of sweets in the ratio 2 : 3.", styles["part"]),
         ("If Sam receives 18 sweets, how many sweets will Tina receive?", styles["body"]),
         ("2 parts = 18 sweets\n1 part = 9 sweets", styles["sub"]),
         ("Tina = 3 × 9 = 27 sweets", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("Question 2", styles["question"]),
         ("12 men can paint a school building in 10 days.", styles["body"]),
         ("Total work = 12 × 10 = 120 man-days", styles["sub"]),
@@ -392,50 +541,60 @@ def main() -> None:
         ("= 120 days", styles["sub"]),
         ("b) How many men would it take to paint the same school in 15 days?", styles["part"]),
         ("120 ÷ 15 = 8 men", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("Question 4", styles["question"]),
         ("A. Find the angles x and y in the diagram, giving reasons for each answer.", styles["part"]),
         ("In triangle ACB:\n55° + 80° + y = 180°\ny = 45°", styles["sub"]),
         ("Since AC ∥ BE, corresponding angles are equal:\nx = 55°", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("B. Find the value of x and the value of y.", styles["part"]),
         ("Triangle angles:\n72° + 2x° + 4y° = 180°\n→ x + 2y = 54", styles["sub"]),
         ("Straight line angles:\n4y + 5x = 180", styles["sub"]),
         ("Solving simultaneously:\nx = 24°, y = 15°", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("Question 5", styles["question"]),
         ("A. Simplify:", styles["part"]),
         ("4(2x + 1) + 3(5x − 2)", styles["body"]),
         ("= 8x + 4 + 15x − 6\n= 23x − 2", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("B. Simplify:", styles["part"]),
         ("−2a(a − 3y) − a(a + 4y)", styles["body"]),
         ("= −2a² + 6ay − a² − 4ay\n= −3a² + 2ay", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("C. Simplify:", styles["part"]),
         ("(x + 4)(x − 3)", styles["body"]),
         ("= x² + x − 12", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("Question 6", styles["question"]),
         ("If t = 4 and p = −3, find the value of:", styles["part"]),
         ("2t − 3p²", styles["body"]),
         ("= 2(4) − 3(9)\n= 8 − 27\n= −19", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("Question 7", styles["question"]),
         ("A. Solve for x:", styles["part"]),
         ("2x + 7 = 4x − 5", styles["body"]),
         ("2x = 12\nx = 6", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("B. Solve for y:", styles["part"]),
         ("5(y − 2) + 12 = 2(y − 5)", styles["body"]),
         ("5y + 2 = 2y − 10\n3y = −12\ny = −4", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("Question 8", styles["question"]),
         ("Bart has x euro.\nLisa has x + 12 euro.\nMaggie has 4x euro.", styles["body"]),
         ("Equation:\nx + (x + 12) = 4x", styles["sub"]),
         ("2x + 12 = 4x\nx = 6", styles["sub"]),
         ("Bart has €6\n(Lisa €18, Maggie €24)", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("Question 9", styles["question"]),
         ("The length of a rectangle is 3 cm longer than its width.", styles["body"]),
         ("Let width = x cm", styles["sub"]),
@@ -444,79 +603,106 @@ def main() -> None:
         ("= 2(x + x + 3)\n= 4x + 6 cm", styles["sub"]),
         ("c) If the perimeter is 26 cm:", styles["part"]),
         ("4x + 6 = 26\nx = 5 cm", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("Question 10", styles["question"]),
         ("A. Solve:", styles["part"]),
         ("5x − 7 > 3, x ∈ ℕ", styles["body"]),
         ("5x > 10\nx > 2", styles["sub"]),
         ("x ≥ 3", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("B. Solve:", styles["part"]),
         ("7x + 1 ≤ 3x − 15, x ∈ ℝ", styles["body"]),
         ("4x ≤ −16\nx ≤ −4", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("Question 11", styles["question"]),
         ("A. Solve:", styles["part"]),
         ("x + y = 5\nx − y = −7", styles["body"]),
         ("2x = −2\nx = −1\ny = 6", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("B. Solve:", styles["part"]),
         ("3x + 4y = 5\n5x − 6y = 2", styles["body"]),
         ("x = 1, y = ½", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("Question 12", styles["question"]),
         ("A. Use Pythagoras’ Theorem to find side length a.", styles["part"]),
         ("a² = 10² + 12²\na = √244\na = 2√61", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("B. Find side length f.", styles["part"]),
         ("f² = 5² − 2²\nf = √21", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("Question 13", styles["question"]),
         ("Area = base × height = 88 cm²\nBase = 11 cm", styles["body"]),
         ("h = 88 ÷ 11\nh = 8 cm", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("Question 14", styles["question"]),
         ("Find the circumference of a circle with diameter 18 cm.", styles["body"]),
         ("C = πd\n= 18π\n≈ 56.5 cm (to 1 d.p.)", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("Question 15", styles["question"]),
         ("a) Work out the area of the front face of the shed.", styles["part"]),
         ("Rectangle area = 8 × 7 = 56 m²\nTriangle area = ½ × 8 × 3 = 12 m²", styles["sub"]),
         ("Total area = 68 m²", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("b) Hence work out the capacity of the shed in litres", styles["part"]),
         ("(1 m³ = 1,000 litres)", styles["body"]),
         ("Volume = 68 × 20 = 1,360 m³\n= 1,360,000 litres", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("Question 16", styles["question"]),
         ("A cylinder with radius 15 cm and height 24 cm", styles["body"]),
         ("Volume = πr²h\n= π × 15² × 24\n= 5400π cm³", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("Question 17", styles["question"]),
         ("A sphere of radius 7 cm fits exactly into a cube.", styles["body"]),
         ("A. Volume of the sphere", styles["part"]),
         ("= (4/3)πr³\n= (4/3)π(7³)\n= (1372/3)π cm³", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("B. Volume of the box", styles["part"]),
         ("Side length = 14 cm", styles["body"]),
         ("14³ = 2744 cm³", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("C. Volume not occupied by the sphere", styles["part"]),
         ("2744 − (1372/3)π\n≈ 1307 cm³ (nearest cm³)", styles["sub"]),
-        ("⸻", styles["separator"]),
+
+        ("__RULE__", styles["separator"]),
         ("D. Percentage of the box not occupied", styles["part"]),
         ("(1307 ÷ 2744) × 100\n≈ 47.6%", styles["sub"]),
     ]
 
     page_width = 595.28
     page_height = 841.89
-    margin = 56.7
+    margin = 62.4  # ~22mm, slightly more “exam board” whitespace
 
     pages = layout_lines(blocks, fonts, page_width, page_height, margin)
-    content_streams = build_content_stream(pages, fonts)
+
+    # Build content streams AFTER layout, so fonts.used_gids is populated.
+    content_streams = build_content_stream(
+        pages,
+        fonts,
+        page_width,
+        page_height,
+        margin,
+        header_left="Answers",
+        header_right="Junior Cycle – Mathematics",
+        footer_left="Candidate: ____________________",
+    )
 
     writer = PDFWriter()
 
+    # Embed fonts (objects are created in separate local writers; we splice their objects in)
     reg_objs = font_objects(fonts["regular"], "DejaVuSans")
     bold_objs = font_objects(fonts["bold"], "DejaVuSans-Bold")
 
@@ -528,11 +714,13 @@ def main() -> None:
     writer.objects.extend(bold_objs[5])
     bold_font_obj = base_index + bold_objs[0]
 
-    content_obj_ids = []
+    # Add page content streams
+    content_obj_ids: List[int] = []
     for stream in content_streams:
         content_obj_ids.append(writer.add_object(stream))
 
-    pages_kids = []
+    # Page objects
+    pages_kids: List[int] = []
     for content_obj in content_obj_ids:
         page_obj = (
             b"<< /Type /Page /Parent 0 0 R /MediaBox [0 0 595.28 841.89]"
@@ -551,13 +739,10 @@ def main() -> None:
         f"<< /Type /Pages /Kids [{kids_refs}] /Count {len(pages_kids)} >>".encode("ascii")
     )
 
-    updated_pages = []
+    # Patch /Parent now that pages_obj exists
     for kid in pages_kids:
         page_content = writer.objects[kid - 1]
-        updated = page_content.replace(b"/Parent 0 0 R", f"/Parent {pages_obj} 0 R".encode("ascii"))
-        updated_pages.append(updated)
-    for idx, kid in enumerate(pages_kids):
-        writer.objects[kid - 1] = updated_pages[idx]
+        writer.objects[kid - 1] = page_content.replace(b"/Parent 0 0 R", f"/Parent {pages_obj} 0 R".encode("ascii"))
 
     catalog_obj = writer.add_object(f"<< /Type /Catalog /Pages {pages_obj} 0 R >>".encode("ascii"))
 
