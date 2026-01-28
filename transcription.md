@@ -151,12 +151,12 @@ B. Solve the following inequality and show your answer on the number line.
 
 **Question 12**
 
-A. Use Pythagoras' Theorem to find the side lengths a and r.
-   Give your answer for r in surd form.
+A. Use Pythagoras' Theorem to find the side lengths a and f.
+   Give your answer for f in surd form.
 
 Diagram 1: Right triangle with a right angle at the lower-left corner, vertical side 10, base 12, and hypotenuse labeled a.
 
-Diagram 2: Right triangle with the right angle at the upper-right corner. The top horizontal side is labeled r, the right vertical side is 2, and the left slanted side is 5.
+Diagram 2: Right triangle with the right angle at the upper-right corner. The top horizontal side is labeled f, the right vertical side is 2, and the left slanted side is 5.
 
 **Question 13**
 
@@ -181,7 +181,7 @@ Its front face is in the shape of an isosceles triangle on top of a rectangle.
 
 a) Work out the area of the front face of the shed.
 
-Diagram description: The front face shows a rectangle with base 8 m and a total height of 10 m. The rectangle height is labeled 7 m, and the top is an isosceles triangle. The sloping roof side is labeled 4 m. The shed length (depth) is labeled 15 m.
+Diagram description: The front face shows a rectangle with base 8 m and a total height of 10 m. The rectangle height is labeled 7 m, and the top is an isosceles triangle. The sloping roof side is labeled 4 m. The shed length (depth) is labeled 9 m.
 
 b) Hence work out the capacity of the shed in litres where 1 m^3 = 1,000 litres.
 
